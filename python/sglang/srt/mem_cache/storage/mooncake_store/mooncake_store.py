@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import requests
 import torch
 
@@ -30,6 +31,17 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+class _PoolIOPlan(msgspec.Struct):
+    """Resolved storage-object layout for one PoolTransfer."""
+
+    name: PoolName
+    key_strs: List[str]
+    ptr_list: List[Any]
+    element_size_list: List[Any]
+    key_multiplier: int
+    group_ids: Optional[List[str]] = None
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -837,15 +849,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        if final_pages == 0 or not pool_transfers:
+            return PoolTransferResult(final_pages, hit_count)
 
-        for transfer in pool_transfers or []:
-            if final_pages == 0:
-                break
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+        # Every pool's component keys go in a single batch_is_exist: the pools
+        # address disjoint objects, so their existence queries are independent.
+        component_keys: List[str] = []
+        spans = []
+        for transfer in pool_transfers:
+            pool_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
-            component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys)
+            start = len(component_keys)
+            component_keys.extend(self._tag_keys(pool_keys))
+            spans.append((transfer, start, len(pool_keys), key_multiplier))
+
+        exist_all = self._batch_exist(component_keys)
+
+        for transfer, start, count, key_multiplier in spans:
+            if final_pages == 0:
+                break
+            ex = exist_all[start : start + count]
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -877,54 +901,125 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         return PoolTransferResult(final_pages, hit_count)
 
+    def _plan_pool_io(self, transfer: PoolTransfer, is_set: bool) -> _PoolIOPlan:
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        keys = transfer.keys
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        host_indices = transfer.host_indices
+        assert len(keys) > 0
+        assert len(keys) == len(host_indices) // page_size
+
+        key_strs, key_multiplier = self._get_hybrid_page_component_keys(keys, transfer)
+        key_strs = self._tag_keys(key_strs)
+        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                key_strs, ptr_list, element_size_list
+            )
+        group_ids = None
+        if is_set and self._can_use_group_semantics():
+            group_ids = self._expand_group_ids(self._tag_keys(keys), key_multiplier)
+        return _PoolIOPlan(
+            name=transfer.name,
+            key_strs=key_strs,
+            ptr_list=ptr_list,
+            element_size_list=element_size_list,
+            key_multiplier=key_multiplier,
+            group_ids=group_ids,
+        )
+
+    @classmethod
+    def _merge_plans(cls, plans: List[_PoolIOPlan]):
+        """Concatenate plans into one batch, returning the per-pool spans.
+
+        Pools may disagree on buffer shape: a layer_first pool is multi-buffer
+        while page_first pools are single-buffer. batch_get_into(k, p, s) and
+        batch_get_into_multi_buffers(k, [[p]], [[s]]) are equivalent for a
+        single-buffer key, because Mooncake's allocateSlices emits exactly one
+        Slice covering the replica. A batch holding both shapes is therefore
+        normalized to multi-buffer; an all-single-buffer batch stays flat.
+        """
+        nested = any(cls._uses_multi_buffer(p.ptr_list) for p in plans)
+        keys: List[str] = []
+        ptrs: List[Any] = []
+        sizes: List[Any] = []
+        group_ids: List[str] = []
+        spans = []
+        for plan in plans:
+            start = len(keys)
+            keys.extend(plan.key_strs)
+            if nested and not cls._uses_multi_buffer(plan.ptr_list):
+                ptrs.extend([p] for p in plan.ptr_list)
+                sizes.extend([s] for s in plan.element_size_list)
+            else:
+                ptrs.extend(plan.ptr_list)
+                sizes.extend(plan.element_size_list)
+            if plan.group_ids is not None:
+                group_ids.extend(plan.group_ids)
+            spans.append((plan, start, len(keys) - start))
+
+        # Mooncake indexes destination slices by key (unordered_map<key,
+        # slices>), so a duplicate key inside one batch would make two objects
+        # share one destination buffer without reporting any error.
+        assert len(set(keys)) == len(keys), "merged pool IO has duplicate keys"
+        assert not group_ids or len(group_ids) == len(keys)
+        if nested:
+            # batch_get_into_multi_buffers narrows the byte count to int32, so a
+            # >=2GiB object would come back as a negative "error" code.
+            assert all(sum(s) < 2**31 for s in sizes)
+        return keys, ptrs, sizes, (group_ids or None), spans
+
+    def _batch_set_missing(
+        self,
+        key_strs: List[str],
+        ptr_list: List[Any],
+        element_size_list: List[Any],
+        group_ids: Optional[List[str]],
+    ) -> List[int]:
+        exist_result = self._batch_exist(key_strs)
+        io_results = [0 if state == 1 else -1 for state in exist_result]
+        missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+        if missing_idx:
+            put_results = self._put_batch_zero_copy_impl(
+                [key_strs[i] for i in missing_idx],
+                [ptr_list[i] for i in missing_idx],
+                [element_size_list[i] for i in missing_idx],
+                self._filter_group_ids(group_ids, missing_idx),
+            )
+            for i, res in zip(missing_idx, put_results):
+                io_results[i] = res
+        return io_results
+
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
-        # storage objects per logical page, but API still reports page-level result.
+        # storage objects per logical page, while the API reports page-level
+        # results. All pools are issued as one Mooncake batch call — they address
+        # disjoint objects with no ordering dependency, and the store submits
+        # every key before waiting on any (Client::BatchGet).
+        plans = [self._plan_pool_io(transfer, is_set) for transfer in transfers]
+        keys, ptrs, sizes, group_ids, spans = self._merge_plans(plans)
+        if is_set:
+            io_results = self._batch_set_missing(keys, ptrs, sizes, group_ids)
+        else:
+            io_results = self._get_batch_zero_copy_impl(keys, ptrs, sizes)
+
         results: dict = {}
-        for transfer in transfers:
-            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
-            keys = transfer.keys
-            page_size = getattr(host_pool, "page_size", 1) or 1
-            host_indices = transfer.host_indices
-            assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
-
-            tagged_keys = self._tag_keys(keys)
-            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+        for plan, start, count in spans:
+            # key_multiplier is per pool, so each span folds with its own value.
+            page_results = self._batch_postprocess(
+                io_results[start : start + count],
+                is_set_operate=is_set,
+                key_multiplier=plan.key_multiplier,
             )
-            key_strs = self._tag_keys(key_strs)
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
+            if not all(page_results):
+                logger.warning(
+                    "Mooncake %s partial failure: pool=%s ok=%d/%d",
+                    "set" if is_set else "get",
+                    plan.name,
+                    sum(page_results),
+                    len(page_results),
                 )
-
-            if is_set:
-                group_ids = (
-                    self._expand_group_ids(tagged_keys, key_multiplier)
-                    if self._can_use_group_semantics()
-                    else None
-                )
-                exist_result = self._batch_exist(key_strs)
-                io_results = [0 if state == 1 else -1 for state in exist_result]
-                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                if missing_idx:
-                    put_results = self._put_batch_zero_copy_impl(
-                        [key_strs[i] for i in missing_idx],
-                        [ptr_list[i] for i in missing_idx],
-                        [element_size_list[i] for i in missing_idx],
-                        self._filter_group_ids(group_ids, missing_idx),
-                    )
-                    for i, res in zip(missing_idx, put_results):
-                        io_results[i] = res
-            else:
-                io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
-                )
-            results[transfer.name] = self._batch_postprocess(
-                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
-            )
+            results[plan.name] = page_results
         return results
 
     def batch_get_v2(
